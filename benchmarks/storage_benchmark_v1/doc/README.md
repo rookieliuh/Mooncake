@@ -1,5 +1,9 @@
 # KVCache Storage Benchmark v1
 
+The 930 extension adds `--backend mooncake` and `--dry-run`.
+See [Mooncake Store testing guide](MOONCAKE_STORE.zh-CN.md) for TCP/UB setup,
+the test matrix, metrics, and verified source baseline. Disk remains the default.
+
 ## Overview
 
 The KVCache Storage Benchmark is a tool for evaluating storage performance of KVCache workloads. It simulates real-world cache access patterns using trace replay and measures storage I/O performance with detailed statistics.
