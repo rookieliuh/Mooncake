@@ -841,6 +841,18 @@ def main():
     if args.progress_interval < 0:
         parser.error("--progress-interval must be non-negative")
     validate_store_arguments(parser, args)
+    if args.backend == "mooncake" and args.action == "cleanup":
+        from store_lifecycle import run_store_cleanup
+
+        result = run_store_cleanup(args)
+        print(json.dumps(result, indent=2))
+        if args.output_json:
+            Path(args.output_json).write_text(
+                json.dumps([result], indent=2), encoding="utf-8"
+            )
+        if result["status"] not in ("ok", "dry_run"):
+            sys.exit(1)
+        return
 
     print(f"\n{'='*80}")
     print(f"{'Mooncake KVCache Storage Benchmark':^80}")

@@ -2,6 +2,8 @@
 
 本次修改基于用户 fork 的 `supercache-snapshot-930`，将该分支的 KVCache Storage Benchmark v1 接入 Mooncake Store。保留 930 原有磁盘路径、FAST25 轨迹格式、MLA 页面布局和延迟分位数算法，新增 Store I/O、预热、纯读写、失败统计与 JSON 输出。实机部署与测量由使用者执行；离线测试不代表网络或集群性能。
 
+跨节点复用请参阅 [A 节点预热、C 节点读取与统一清理](MULTINODE.zh-CN.md)。指定 `--namespace` 可跨进程共享对象；`--action prefill` 独立预热，`--action cleanup` 按写端清单统一清理。不指定 namespace 时，本页原有单客户端用法保持不变。
+
 ## 源码与兼容性范围
 
 - 仓库：[rookieliuh/Mooncake](https://github.com/rookieliuh/Mooncake/tree/supercache-snapshot-930)。基线 commit：`d869f481e11aed2a6ee4860135646188a50bce5a`。
@@ -99,7 +101,9 @@ python benchmark.py \
 | TCP 对 RDMA | `--protocol rdma --device-name mlx5_0` | 需要 RDMA 构建和正确设备；示例名称仅作占位 |
 | UB | `--protocol ub --device-name urma0` | 930 源码已确认该协议；设备名仅作占位，需 USE_UB 构建与实机验证 |
 
-所有场景使用自动生成的 `mcbench-<uuid>` 命名空间。默认在所有 worker 停止后，对本轮尝试写入的精确 key 调用 `remove(key, force=True)`；不使用 `remove_all` 或正则删除。930 普通删除可能被对象租约拒绝，所以 cleanup 使用 force 并将已淘汰的 `OBJECT_NOT_FOUND=-704` 视为已清理。`--keep-keys` 可保留本轮对象，但以后运行仍使用新命名空间，旧 key 不会被下一轮自动清理，可能占用容量。
+未指定 `--namespace` 时使用自动生成的 `mcbench-<uuid>` 命名空间；`--key-scope shared` 此时只共享本进程内的对象。默认在所有本地 worker 停止后，对本轮尝试写入的精确 key 调用 `remove(key, force=True)`；不使用 `remove_all` 或正则删除。930 普通删除可能被对象租约拒绝，所以 cleanup 使用 force 并将已淘汰的 `OBJECT_NOT_FOUND=-704` 视为已清理。`--keep-keys` 可保留本轮对象，但以后运行仍使用新命名空间，旧 key 不会被下一轮自动清理，可能占用容量。
+
+指定 namespace 后，模型布局与完整轨迹文件指纹加入 key，跨进程共享仅在这些内容一致时成立。自动清理关闭，写端必须保存 `--key-manifest`。待所有节点读写结束后，由一个节点执行 `--action cleanup --cleanup-manifest ...`。外部预热后的只读进程可使用 `--access-mode read` 而不加 warmup。详细命令和限制见跨节点指南。
 
 930 的 `Client::Put` 对已存在对象可能直接成功返回，不传输页面。纯写模式因此改为每次唯一 key；它的保留容量是「页面访问次数 × 客户端数 × 页面大小」，dry-run 会按这个口径计算。cache 模式保留真实 hash 复用关系；多客户端共享 key 时，竞争产生的重复 put 仍可能是 no-op，所以结果字节数是成功 API 的逻辑负载量，不承诺等于物理网络流量。
 

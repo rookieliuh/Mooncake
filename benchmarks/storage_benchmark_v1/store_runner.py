@@ -4,6 +4,7 @@ import hashlib
 import math
 import os
 import platform
+import re
 import threading
 import time
 import uuid
@@ -12,7 +13,8 @@ from dataclasses import asdict, replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from storage.mooncake_store import MooncakeStoreStorage, StoreConfig
+from storage.mooncake_store import MooncakeStoreStorage
+from store_lifecycle import dataset_identity, save_key_manifest, store_config
 
 SOURCE_BASE = {
     "repository": "https://github.com/rookieliuh/Mooncake",
@@ -38,6 +40,26 @@ ENV_FIELDS = (
 
 
 def add_store_arguments(parser):
+    parser.add_argument(
+        "--action", choices=("replay", "prefill", "cleanup"), default="replay"
+    )
+    parser.add_argument(
+        "--namespace",
+        help="Explicit experiment ID shared across processes; disables automatic cleanup",
+    )
+    parser.add_argument(
+        "--client-id",
+        help="Unique client identity; required for explicit independent namespaces",
+    )
+    parser.add_argument(
+        "--key-manifest",
+        help="New local file recording planned writes for later centralized cleanup",
+    )
+    parser.add_argument(
+        "--cleanup-manifest",
+        nargs="+",
+        help="Manifests from ALL writers, used only by --action cleanup",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -97,6 +119,14 @@ def add_store_arguments(parser):
 
 def validate_store_arguments(parser, args):
     if args.backend != "mooncake":
+        if (
+            args.action != "replay"
+            or args.namespace
+            or args.client_id
+            or args.key_manifest
+            or args.cleanup_manifest
+        ):
+            parser.error("namespace and lifecycle options require --backend mooncake")
         if args.dry_run:
             parser.error("--dry-run requires --backend mooncake")
         return
@@ -113,7 +143,69 @@ def validate_store_arguments(parser, args):
         parser.error("Store memory sizes must be nonnegative/positive respectively")
     if args.max_requests is not None and args.max_requests <= 0:
         parser.error("--max-requests must be positive")
-    if args.access_mode == "read" and not args.warmup:
+    protected_paths = ([args.key_manifest] if args.key_manifest else []) + (
+        args.cleanup_manifest or []
+    )
+    if args.output_json and any(
+        Path(args.output_json).resolve() == Path(path).resolve()
+        for path in protected_paths
+    ):
+        parser.error("--output-json must not overwrite a key manifest")
+    for field in ("namespace", "client_id"):
+        value = getattr(args, field)
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value):
+            parser.error(
+                f"--{field.replace('_', '-')} must be 1-80 ASCII letters, digits, underscores or hyphens"
+            )
+    if args.action == "cleanup":
+        if not args.cleanup_manifest or not args.master_server:
+            parser.error(
+                "cleanup requires --cleanup-manifest and --master-server (also for dry-run)"
+            )
+        if (
+            args.threads != 1
+            or args.warmup
+            or args.keep_keys
+            or args.namespace
+            or args.key_manifest
+            or args.client_id
+            or args.access_mode != "cache"
+        ):
+            parser.error(
+                "cleanup uses manifests only: omit namespace/replay/warmup options and use one thread"
+            )
+        return
+    if args.cleanup_manifest:
+        parser.error("--cleanup-manifest requires --action cleanup")
+    if args.namespace and args.key_scope == "independent" and not args.client_id:
+        parser.error(
+            "explicit independent namespace requires a globally unique --client-id"
+        )
+    if args.key_manifest and not args.namespace:
+        parser.error("--key-manifest requires --namespace")
+    if args.action == "prefill" and (
+        not args.namespace or args.access_mode != "cache" or args.warmup
+    ):
+        parser.error(
+            "prefill requires --namespace, --access-mode cache and no --warmup"
+        )
+    writes = args.action == "prefill" or args.warmup or args.access_mode != "read"
+    if args.key_manifest and not writes:
+        parser.error(
+            "read-only replay does not write a key manifest; retain the writer's manifest"
+        )
+    if args.namespace and writes and not args.key_manifest and not args.dry_run:
+        parser.error(
+            "explicit namespace writers require --key-manifest for centralized cleanup"
+        )
+    if args.namespace and (
+        args.scenario == "all"
+        or len([s for s in args.replay_scales.split(",") if s.strip()]) != 1
+    ):
+        parser.error(
+            "explicit namespace runs require one scenario and one replay scale per invocation"
+        )
+    if args.access_mode == "read" and not args.warmup and not args.namespace:
         parser.error("--access-mode read requires --warmup for the fresh run namespace")
     if args.access_mode == "write" and args.warmup:
         parser.error(
@@ -169,16 +261,16 @@ def run_store_benchmark(
     if not requests:
         raise ValueError("trace has no requests")
 
-    config = StoreConfig(
-        local_hostname=args.local_hostname,
-        metadata_server=args.metadata_server,
-        master_server_addr=args.master_server,
-        protocol=args.protocol,
-        device_name=args.device_name,
-        global_segment_size=args.global_segment_size,
-        local_buffer_size=args.local_buffer_size,
-        io_api=args.io_api,
-        verify=args.verify,
+    config = store_config(args)
+    action = getattr(args, "action", "replay")
+    explicit_namespace = getattr(args, "namespace", None)
+    execution_id = uuid.uuid4().hex
+    client_id = getattr(args, "client_id", None) or execution_id
+    dataset_id = dataset_identity(model_config, trace_bytes)
+    namespace = (
+        f"mcbench-{explicit_namespace}:v2:{dataset_id}"
+        if explicit_namespace
+        else f"mcbench-{execution_id}"
     )
     page_size = create_layout(model_config, 512).value_size_bytes
     unique_ids = sorted({page for req in requests for page in req.hash_ids})
@@ -207,6 +299,10 @@ def run_store_benchmark(
             "schema_version": 1,
             "source_base": SOURCE_BASE,
             "backend": "mooncake",
+            "action": action,
+            "dataset_id": dataset_id,
+            "experiment_namespace": explicit_namespace,
+            "namespace": namespace,
             "status": "dry_run",
             "trace_file": Path(trace_path).name,
             "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
@@ -218,7 +314,36 @@ def run_store_benchmark(
             "access_mode": args.access_mode,
             **sizing,
         }
-    namespace = f"mcbench-{uuid.uuid4().hex}"
+    prefixes = [
+        namespace
+        if args.key_scope == "shared"
+        else (
+            f"{namespace}:client-{client_id}:worker-{i}"
+            if explicit_namespace
+            else f"{namespace}:worker-{i}"
+        )
+        for i in range(args.threads)
+    ]
+
+    def write_page_id(worker_id, sequence, page_id):
+        return f"write-{client_id}-{execution_id}-{worker_id}-{sequence}-{page_id}"
+
+    manifest_path = getattr(args, "key_manifest", None)
+    if manifest_path:
+        if args.access_mode == "write":
+            pages = [page for req in requests for page in req.hash_ids]
+            planned_keys = (
+                f"{prefix}:{write_page_id(i, sequence, page)}"
+                for i, prefix in enumerate(prefixes)
+                for sequence, page in enumerate(pages, 1)
+            )
+        else:
+            planned_keys = (
+                f"{prefix}:{page}" for prefix in prefixes for page in unique_ids
+            )
+        save_key_manifest(
+            manifest_path, namespace, planned_keys, args.master_server, execution_id
+        )
     print(f"Store namespace: {namespace}")
     print(
         f"Unique pages: {len(unique_ids)}; page size: {page_size} bytes; key scope: {args.key_scope}"
@@ -233,6 +358,9 @@ def run_store_benchmark(
     elapsed = 0.0
     phase = "setup"
     status = "ok"
+    preparation_stats = []
+    measurement_start_unix = None
+    measurement_end_unix = None
 
     def process(worker, start):
         bench = worker["benchmark"]
@@ -269,7 +397,9 @@ def run_store_benchmark(
                         # idempotent no-op from inflating write throughput.
                         if args.access_mode == "write":
                             worker["write_sequence"] += 1
-                            page_id = f"write-{worker['id']}-{worker['write_sequence']}-{page_id}"
+                            page_id = write_page_id(
+                                worker["id"], worker["write_sequence"], page_id
+                            )
                         io_latency += op(page_id)
                     bench.stats["request_io_latencies_ms"].append(io_latency)
                     bench.stats["request_wall_latencies_ms"].append(
@@ -303,11 +433,7 @@ def run_store_benchmark(
                     "{worker}", str(worker_id)
                 ),
             )
-            prefix = (
-                namespace
-                if args.key_scope == "shared"
-                else f"{namespace}:worker-{worker_id}"
-            )
+            prefix = prefixes[worker_id]
             store = MooncakeStoreStorage(
                 page_size, prefix, worker_config, client_factory
             )
@@ -327,27 +453,40 @@ def run_store_benchmark(
                 }
             )
         phase = "warmup"
-        if args.warmup:
+        if args.warmup or action == "prefill":
             for worker in workers:
                 if args.key_scope == "shared" and worker["id"] != 0:
                     continue
                 for page_id in unique_ids:
                     worker["benchmark"].storage.write(page_id)
+                    if action == "prefill" and args.verify:
+                        worker["benchmark"].storage.read(page_id)
+        preparation_stats = [w["benchmark"].storage.get_stats() for w in workers]
         for worker in workers:
             worker["benchmark"].storage.reset_stats()
-        phase = "measurement"
-        start = time.perf_counter()
-        try:
-            with ThreadPoolExecutor(max_workers=args.threads) as pool:
-                futures = [pool.submit(process, worker, start) for worker in workers]
-                try:
-                    for future in futures:
-                        future.result()
-                except BaseException:
-                    stop.set()
-                    raise
-        finally:
-            elapsed = time.perf_counter() - start
+        if action == "prefill":
+            phase = "prefill_complete"
+            print(
+                f"Prefill complete: {sum(s['write']['count'] for s in preparation_stats)} write calls; objects retained for explicit cleanup"
+            )
+        else:
+            phase = "measurement"
+            measurement_start_unix = time.time()
+            start = time.perf_counter()
+            try:
+                with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                    futures = [
+                        pool.submit(process, worker, start) for worker in workers
+                    ]
+                    try:
+                        for future in futures:
+                            future.result()
+                    except BaseException:
+                        stop.set()
+                        raise
+            finally:
+                elapsed = time.perf_counter() - start
+                measurement_end_unix = time.time()
         if errors:
             status = "failed"
     except KeyboardInterrupt:
@@ -409,7 +548,7 @@ def run_store_benchmark(
     for worker in workers:
         store = worker["benchmark"].storage
         try:
-            if not args.keep_keys:
+            if not args.keep_keys and not explicit_namespace:
                 for page_id in list(store._touched_pages):
                     try:
                         # All workers have stopped; exact run-owned keys only.
@@ -441,11 +580,25 @@ def run_store_benchmark(
         "client_environment": {name: os.environ.get(name) for name in ENV_FIELDS},
         "byte_accounting": "successful logical API payload bytes; shared-cache duplicate puts can be no-ops",
         "backend": "mooncake",
+        "action": action,
+        "experiment_namespace": explicit_namespace,
+        "dataset_id": dataset_id,
+        "client_id": client_id,
+        "execution_id": execution_id,
+        "key_manifest": manifest_path,
+        "cleanup_policy": "explicit_manifest"
+        if explicit_namespace
+        else ("keep" if args.keep_keys else "automatic"),
+        "preparation_stats": preparation_stats,
+        "measurement_start_unix": measurement_start_unix,
+        "measurement_end_unix": measurement_end_unix,
         "status": status,
         "phase": phase,
         "errors": errors,
         "cleanup_errors": cleanup_errors,
-        "preparation_failure_stats": store_stats if not measurement else [],
+        "preparation_failure_stats": store_stats
+        if phase in ("setup", "warmup")
+        else [],
         "trace_file": Path(trace_path).name,
         "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
         "namespace": namespace,
@@ -469,7 +622,7 @@ def run_store_benchmark(
         "total_requests": completed,
         "attempted_requests": sum(w["attempted"] for w in workers),
         "failed_requests": sum(w["failed"] for w in workers),
-        "offered_requests": len(requests) * args.threads,
+        "offered_requests": len(requests) * args.threads if action == "replay" else 0,
         "total_tokens": sum(w["tokens"] for w in workers),
         "total_pages": reads + writes,
         "read_pages": reads,

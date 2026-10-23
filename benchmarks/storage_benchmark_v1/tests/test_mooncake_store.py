@@ -6,6 +6,7 @@ import ctypes
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,7 @@ from store_runner import (
     run_store_benchmark,
     validate_store_arguments,
 )
+from store_lifecycle import run_store_cleanup
 
 
 class FakeStore:
@@ -461,6 +463,317 @@ class ReplayTests(unittest.TestCase):
         args = parser.parse_args(["--backend", "mooncake"])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             validate_store_arguments(parser, args)
+
+    def shared_writer(self, name="A", action="prefill"):
+        self.args.namespace = "experiment-1"
+        self.args.client_id = name
+        self.args.key_scope = "shared"
+        self.args.action = action
+        self.args.key_manifest = str(Path(self.temp.name) / f"{name}.keys.json")
+        return self.run_case()
+
+    def cleanup(self, paths):
+        self.args.cleanup_manifest = paths
+        self.args.dry_run = False
+        return run_store_cleanup(self.args, self.factory)
+
+    def test_shared_prefill_reader_and_central_cleanup(self):
+        prefill = self.shared_writer()
+        manifest = self.args.key_manifest
+        self.assertEqual(prefill["status"], "ok")
+        self.assertEqual(prefill["phase"], "prefill_complete")
+        self.assertEqual(prefill["total_requests"], 0)
+        self.assertEqual(prefill["offered_requests"], 0)
+        self.assertEqual(prefill["preparation_stats"][0]["write"]["count"], 3)
+        self.assertEqual(len(self.objects), 4)
+        self.assertFalse(self.clients[0].remove_calls)
+        self.args.action = "replay"
+        self.args.client_id = "C"
+        self.args.local_hostname = "other-host"
+        self.args.key_manifest = None
+        self.args.access_mode = "read"
+        self.args.threads = 2
+        read = self.run_case()
+        self.assertEqual(read["namespace"], prefill["namespace"])
+        self.assertEqual((read["read_pages"], read["write_pages"]), (8, 0))
+        self.assertEqual(read["status"], "ok")
+        self.assertEqual(len(self.objects), 4)
+        self.assertTrue(all(not c.remove_calls for c in self.clients))
+        cleaned = self.cleanup([manifest, manifest])
+        self.assertEqual(cleaned["deleted_keys"], 3)
+        self.assertEqual(cleaned["planned_keys"], 3)
+        self.assertEqual(self.objects, {"unrelated-production-key": b"keep"})
+        self.assertEqual(self.cleanup([manifest])["already_missing_keys"], 3)
+
+    def test_shared_identity_separates_model_trace_and_experiment(self):
+        first = self.shared_writer()
+        self.args.action = "replay"
+        self.args.access_mode = "read"
+        self.args.key_manifest = None
+        self.args.max_requests = 1
+        self.assertEqual(self.run_case()["read_pages"], 2)
+        self.args.namespace = "other-experiment"
+        self.assertEqual(self.run_case()["status"], "failed")
+        self.args.namespace = "experiment-1"
+        self.trace.write_text(self.trace.read_text() + "\n", encoding="utf-8")
+        self.assertNotEqual(self.run_case()["namespace"], first["namespace"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = run_store_benchmark(
+                str(self.trace), dict(MODEL, num_layers=2), self.args, 0, self.factory
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertNotEqual(result["namespace"], first["namespace"])
+
+    def test_explicit_independent_clients_do_not_collide(self):
+        self.args.namespace = "experiment-1"
+        self.args.action = "prefill"
+        manifests = []
+        for name in ("A", "C"):
+            self.args.client_id = name
+            self.args.key_manifest = str(Path(self.temp.name) / f"{name}.json")
+            manifests.append(self.args.key_manifest)
+            self.assertEqual(self.run_case()["status"], "ok")
+        self.assertEqual(len(self.objects), 7)
+        self.assertEqual(self.cleanup(manifests)["deleted_keys"], 6)
+
+    def test_explicit_write_keys_unique_across_clients_and_restarts(self):
+        manifests = []
+        self.args.access_mode = "write"
+        for index, name in enumerate(("A", "C", "A")):
+            # Even a restarted client with the same ID cannot repeat put keys.
+            self.args.namespace = "experiment-1"
+            self.args.key_scope = "shared"
+            self.args.client_id = name
+            self.args.key_manifest = str(Path(self.temp.name) / f"{index}.json")
+            result = self.run_case()
+            manifests.append(self.args.key_manifest)
+            self.assertEqual(result["write_pages"], 4)
+        self.assertEqual(sum(c.transferred_write_bytes for c in self.clients), 12 * 512)
+        self.assertEqual(self.cleanup(manifests)["deleted_keys"], 12)
+
+    def test_failed_prefill_retains_inventory_and_objects_for_cleanup(self):
+        self.args.namespace = "experiment-1"
+        self.args.key_scope = "shared"
+        self.args.action = "prefill"
+        manifest = str(Path(self.temp.name) / "partial.json")
+        self.args.key_manifest = manifest
+
+        def factory():
+            # Inventory must exist before the first connection/write.
+            self.assertEqual(len(json.loads(Path(manifest).read_text())["keys"]), 3)
+            client = self.factory()
+            put = client.put_from
+
+            def fail_after_commit(key, ptr, size):
+                result = put(key, ptr, size)
+                return -1 if key.endswith(":2") else result
+
+            client.put_from = fail_after_commit
+            return client
+
+        result = self.run_case(factory)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(self.objects), 3)
+        self.assertFalse(self.clients[0].remove_calls)
+        cleanup = self.cleanup([manifest])
+        self.assertEqual(cleanup["deleted_keys"], 2)
+        self.assertEqual(cleanup["already_missing_keys"], 1)
+
+    def test_manifest_overwrite_and_invalid_cleanup_rejected_before_connect(self):
+        self.shared_writer()
+        manifest = self.args.key_manifest
+        clients = len(self.clients)
+        with self.assertRaises(FileExistsError):
+            self.run_case()
+        self.assertEqual(len(self.clients), clients)
+        record = json.loads(Path(manifest).read_text())
+        record["keys"].append("unrelated-production-key")
+        Path(manifest).write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.cleanup([manifest])
+        self.assertEqual(len(self.clients), clients)
+        record["keys"].pop()
+        record["master_server"] = "other-cluster"
+        Path(manifest).write_text(json.dumps(record))
+        with self.assertRaisesRegex(ValueError, "Master differs"):
+            self.cleanup([manifest])
+
+    def test_central_cleanup_continues_after_error_and_is_retryable(self):
+        self.shared_writer()
+        manifest = self.args.key_manifest
+        self.args.cleanup_manifest = [manifest]
+        self.args.dry_run = True
+        clients = len(self.clients)
+        self.assertEqual(run_store_cleanup(self.args, self.factory)["planned_keys"], 3)
+        self.assertEqual(len(self.clients), clients)
+        self.args.dry_run = False
+
+        def factory():
+            client = self.factory()
+            remove = client.remove
+            client.remove = (
+                lambda key, force=False: -1
+                if key.endswith(":2")
+                else remove(key, force)
+            )
+            return client
+
+        result = run_store_cleanup(self.args, factory)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["deleted_keys"], 2)
+        self.assertTrue(self.clients[-1].closed)
+        self.assertEqual(self.cleanup([manifest])["deleted_keys"], 1)
+
+    def test_shared_cli_validation(self):
+        parser = argparse.ArgumentParser()
+        add_store_arguments(parser)
+        defaults = dict(
+            page_size_tokens=512,
+            fsync_mode="none",
+            max_requests=2,
+            threads=1,
+            scenario="conversation",
+            replay_scales="0",
+        )
+        base = [
+            "--backend",
+            "mooncake",
+            "--master-server",
+            "master",
+            "--metadata-server",
+            "metadata",
+            "--local-hostname",
+            "host",
+        ]
+        valid = [
+            ["--namespace", "exp", "--key-scope", "shared", "--access-mode", "read"],
+            [
+                "--namespace",
+                "exp",
+                "--key-scope",
+                "shared",
+                "--action",
+                "prefill",
+                "--key-manifest",
+                "keys.json",
+            ],
+            ["--action", "cleanup", "--cleanup-manifest", "keys.json"],
+        ]
+        for options in valid:
+            args = parser.parse_args(base + options)
+            vars(args).update(defaults)
+            validate_store_arguments(parser, args)
+        invalid = [
+            ["--namespace", "exp"],
+            ["--namespace", "exp", "--key-scope", "shared"],
+            ["--action", "prefill"],
+            ["--action", "cleanup"],
+            [
+                "--namespace",
+                "bad:name",
+                "--key-scope",
+                "shared",
+                "--access-mode",
+                "read",
+            ],
+            ["--access-mode", "read"],
+            [
+                "--action",
+                "cleanup",
+                "--cleanup-manifest",
+                "keys.json",
+                "--output-json",
+                "keys.json",
+            ],
+        ]
+        for options in invalid:
+            args = parser.parse_args(base + options)
+            vars(args).update(defaults)
+            with self.subTest(options=options), contextlib.redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
+                validate_store_arguments(parser, args)
+
+    def test_cli_lifecycle_across_three_separate_processes(self):
+        # Three real Python processes share a persisted FakeStore, exercising
+        # CLI parsing, imports, key identity, verification and JSON exit status.
+        # This is not a native/network test.
+        script = """
+import sys, types, json, base64
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from test_mooncake_store import FakeStore, MODEL
+db = Path(sys.argv.pop(1))
+objects = {k: base64.b64decode(v) for k,v in json.loads(db.read_text()).items()} if db.exists() else {}
+class PersistentFake(FakeStore):
+    def __init__(self): super().__init__(objects)
+    def close(self):
+        db.write_text(json.dumps({k: base64.b64encode(v).decode() for k,v in objects.items()}))
+        return super().close()
+module = types.ModuleType("mooncake.store")
+module.MooncakeDistributedStore = PersistentFake
+sys.modules["mooncake"] = types.ModuleType("mooncake")
+sys.modules["mooncake.store"] = module
+import benchmark
+benchmark.get_model_config = lambda name: MODEL
+benchmark.main()
+"""
+        root = Path(self.temp.name)
+        (root / "conversation_trace.jsonl").write_bytes(self.trace.read_bytes())
+        common = [
+            "--backend",
+            "mooncake",
+            "--master-server",
+            "master",
+            "--metadata-server",
+            "metadata",
+            "--local-hostname",
+            "host",
+        ]
+        replay = [
+            "--namespace",
+            "three-process",
+            "--key-scope",
+            "shared",
+            "--trace-dir",
+            str(root),
+            "--scenario",
+            "conversation",
+            "--verify",
+        ]
+        manifest = str(root / "keys.json")
+        steps = [
+            replay
+            + ["--action", "prefill", "--key-manifest", manifest, "--client-id", "A"],
+            replay + ["--access-mode", "read", "--client-id", "C"],
+            [
+                "--action",
+                "cleanup",
+                "--cleanup-manifest",
+                manifest,
+                "--trace-dir",
+                str(root / "absent"),
+            ],
+        ]
+        results = []
+        for index, options in enumerate(steps):
+            output = root / f"result-{index}.json"
+            done = subprocess.run(
+                [sys.executable, "-B", "-c", script, str(root / "db.json")]
+                + common
+                + options
+                + ["--output-json", str(output)],
+                cwd=Path(__file__).resolve().parents[1],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            results.append(json.loads(output.read_text())[0])
+        self.assertEqual(results[0]["namespace"], results[1]["namespace"])
+        self.assertEqual((results[1]["read_pages"], results[1]["write_pages"]), (4, 0))
+        self.assertEqual(results[2]["deleted_keys"], 3)
+        self.assertEqual(json.loads((root / "db.json").read_text()), {})
 
 
 if __name__ == "__main__":
