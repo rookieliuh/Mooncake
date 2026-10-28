@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import io
 import json
+import mmap
 import os
 import subprocess
 import sys
@@ -33,6 +34,7 @@ class FakeStore:
     def __init__(self, objects=None):
         self.objects = objects if objects is not None else {}
         self.registered = set()
+        self.regions = {}
         self.closed = False
         self.transferred_write_bytes = 0
         self.remove_calls = []
@@ -43,10 +45,12 @@ class FakeStore:
 
     def register_buffer(self, ptr, size):
         self.registered.add(ptr)
+        self.regions[ptr] = size
         return 0
 
     def unregister_buffer(self, ptr):
         self.registered.remove(ptr)
+        self.regions.pop(ptr)
         return 0
 
     def is_exist(self, key):
@@ -78,6 +82,33 @@ class FakeStore:
             return -704
         del self.objects[key]
         return 0
+
+    def batch_is_exist(self, keys):
+        return [self.is_exist(key) for key in keys]
+
+    def batch_put_from(self, keys, ptrs, sizes):
+        for ptr, size in zip(ptrs, sizes):
+            assert any(
+                base <= ptr and ptr + size <= base + length
+                for base, length in self.regions.items()
+            )
+        return [
+            self.put(key, ctypes.string_at(ptr, size))
+            for key, ptr, size in zip(keys, ptrs, sizes)
+        ]
+
+    def batch_get_into(self, keys, ptrs, sizes):
+        for ptr, size in zip(ptrs, sizes):
+            assert any(
+                base <= ptr and ptr + size <= base + length
+                for base, length in self.regions.items()
+            )
+        result = []
+        for key, ptr, size in zip(keys, ptrs, sizes):
+            data = self.get(key)
+            ctypes.memmove(ptr, data, min(size, len(data)))
+            result.append(len(data))
+        return result
 
     def close(self):
         self.closed = True
@@ -112,6 +143,55 @@ class BackendTests(unittest.TestCase):
             store.delete(7)
             self.assertFalse(store.exists(7))
             self.assertEqual(store.get_stats()["read"]["count"], 2)
+
+    def test_batch_alignment_contiguous_slots_and_full_verification(self):
+        store, client = self.make_store("batch")
+        self.assertEqual(len(client.registered), 2)
+        self.assertTrue(all(ptr % mmap.PAGESIZE == 0 for ptr in client.registered))
+        self.assertEqual(
+            ctypes.addressof(store._send_slots[1])
+            - ctypes.addressof(store._send_slots[0]),
+            64,
+        )
+        store.batch_write([1, 2, 3])
+        self.assertEqual(store.batch_exists([1, 9, 3]), [True, False, True])
+        store.batch_read([1, 2, 3])
+        data = client.objects[store.key(2)]
+        client.objects[store.key(2)] = data[:-1] + bytes([data[-1] ^ 1])
+        with self.assertRaisesRegex(StorageOperationError, "verification"):
+            store.batch_read([1, 2, 3])
+        self.assertEqual(store.stats["read_count"], 5)
+        self.assertEqual(store.stats["verification_failures"], 1)
+        maps = list(store._maps)
+        store.close()
+        self.assertTrue(all(region.closed for region in maps))
+        self.assertFalse(client.registered)
+
+    def test_batch_errors_and_partial_success(self):
+        store, client = self.make_store("batch")
+        client.batch_is_exist = lambda keys: [1, -1]
+        with self.assertRaisesRegex(StorageOperationError, "batch_is_exist"):
+            store.batch_exists([1, 2])
+        self.assertEqual(store.stats["exists_hits"], 1)
+        client.batch_put_from = lambda *args: [0, -5]
+        with self.assertRaises(StorageOperationError):
+            store.batch_write([1, 2])
+        self.assertEqual(store.stats["write_count"], 1)
+        self.assertEqual(store._touched_pages, {1, 2})
+        self.assertEqual(store._written_pages, {1})
+        for results in ([], [64], [64, -1], [64, 63]):
+            client.batch_get_into = lambda *args: results
+            with self.assertRaises(StorageOperationError):
+                store.batch_read([1, 2])
+        with self.assertRaises(ValueError):
+            store.batch_write(list(range(9)))
+
+    def test_invalid_batch_size(self):
+        for size in (0, -1):
+            with self.assertRaises(ValueError):
+                MooncakeStoreStorage(
+                    64, "run", StoreConfig("h", "m", "s", batch_size=size), FakeStore
+                )
 
     def test_exists_error_is_not_truthy_hit(self):
         store, client = self.make_store()
@@ -331,6 +411,69 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(all(c.closed and not c.registered for c in self.clients))
         json.dumps(result, allow_nan=False)
         self.assertIn("Status:           ok", format_storage_stats(result))
+
+    def test_batch_cache_read_write_and_prefill(self):
+        self.args.io_api = "batch"
+        self.args.batch_size = 2
+        cold = self.run_case()
+        self.assertEqual((cold["read_pages"], cold["write_pages"]), (1, 3))
+        self.assertEqual(cold["storage"]["batch_calls"]["exists"]["count"], 2)
+        self.args.access_mode = "write"
+        writes = self.run_case()
+        self.assertEqual(writes["write_pages"], 4)
+        self.assertEqual(writes["storage"]["batch_calls"]["write"]["count"], 2)
+        self.args.access_mode = "cache"
+        prefill = self.shared_writer()
+        self.assertEqual(
+            prefill["preparation_stats"][0]["batch_calls"]["write"]["count"], 2
+        )
+        self.args.action = "replay"
+        self.args.access_mode = "read"
+        self.args.key_manifest = None
+        result = self.run_case()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual((result["read_pages"], result["write_pages"]), (4, 0))
+        self.assertEqual(result["storage"]["batch_calls"]["read"]["count"], 2)
+        self.assertEqual(
+            result["storage"]["latency_semantics"], "amortized_batch_time_per_page"
+        )
+
+    def test_batch_repeated_hash_preserves_miss_hit_order(self):
+        self.args.io_api = "batch"
+        self.rows[0]["hash_ids"] = [1, 1, 2]
+        self.trace.write_text("\n".join(json.dumps(row) for row in self.rows))
+        result = self.run_case()
+        self.assertEqual((result["read_pages"], result["write_pages"]), (2, 3))
+
+    def test_fast_exit_keeps_cli_failure_code(self):
+        root = Path(__file__).resolve().parents[1]
+        for fast in ("0", "1"):
+            result = subprocess.run(
+                [sys.executable, "-B", "benchmark.py", "--backend", "mooncake"],
+                cwd=root,
+                env=dict(os.environ, MC_EXIT_FAST=fast),
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 2)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "benchmark.py",
+                    "--backend",
+                    "mooncake",
+                    "--dry-run",
+                    "--max-requests",
+                    "1",
+                ],
+                cwd=root,
+                env=dict(os.environ, MC_EXIT_FAST=fast),
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(b"dry_run", result.stdout)
 
     def test_warm_shared_and_independent_replay(self):
         self.args.threads = 2

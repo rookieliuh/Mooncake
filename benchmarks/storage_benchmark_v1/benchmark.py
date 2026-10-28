@@ -11,6 +11,7 @@ import sys
 import time
 import statistics
 import math
+import os
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -140,8 +141,8 @@ class StorageBenchmark:
         request_start = time.perf_counter()
         io_latency_ms = 0.0
 
-        # Process each access requirement from layout
-        for access in self.layout.get_operations(req):
+        def handle_single(access):
+            nonlocal io_latency_ms
             if self.storage.exists(access.page_id):
                 # Page exists, perform READ
                 io_latency_ms += self.storage.read(
@@ -159,6 +160,44 @@ class StorageBenchmark:
                     length=access.length,
                 )
                 self.stats["write_pages"] += 1
+
+        window = getattr(self.storage, "batch_window", 1)
+        pending = []
+
+        def flush_batch():
+            nonlocal io_latency_ms
+            if not pending:
+                return
+            hits = self.storage.batch_exists(pending)
+            reads = [p for p, hit in zip(pending, hits) if hit]
+            writes = [p for p, hit in zip(pending, hits) if not hit]
+            if reads:
+                io_latency_ms += self.storage.batch_read(reads)
+                self.stats["read_pages"] += len(reads)
+                self.stats["page_hits"] += len(reads)
+            if writes:
+                io_latency_ms += self.storage.batch_write(writes)
+                self.stats["write_pages"] += len(writes)
+            pending.clear()
+
+        if os.environ.get("MC_BATCH_DEBUG") == "1":
+            print(f"batch window={window} hash_ids={len(req.hash_ids)}")
+        for access in self.layout.get_operations(req):
+            full = access.offset_in_page == 0 and access.length in (
+                None,
+                getattr(self.storage, "page_size", None),
+            )
+            if window > 1 and hasattr(self.storage, "batch_read") and full:
+                # Preserve repeated-key miss->hit ordering within a request.
+                if access.page_id in pending:
+                    flush_batch()
+                pending.append(access.page_id)
+                if len(pending) == window:
+                    flush_batch()
+            else:
+                flush_batch()
+                handle_single(access)
+        flush_batch()
 
         wall_latency_ms = (time.perf_counter() - request_start) * 1000.0
         self.stats["request_io_latencies_ms"].append(io_latency_ms)
@@ -651,6 +690,10 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
         for error in stats["errors"] + stats["cleanup_errors"]:
             output.append(f"  Error:            {error}")
     output.append(f"  Model:            {stats.get('model', 'N/A')}")
+    if storage.get("latency_semantics") == "amortized_batch_time_per_page":
+        output.append(
+            "  Page latencies:   amortized batch time/page; NOT individual page completion latency"
+        )
     output.append(f"  Threads:          {stats.get('threads', 1)}")
     replay_scale = stats.get("replay_scale", 0)
     output.append(
@@ -938,3 +981,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Explicit workaround for reported UB finalization crashes. Failure exits
+    # from main() are NOT converted to success; normal close runs beforehand.
+    if os.environ.get("MC_EXIT_FAST") == "1":
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)

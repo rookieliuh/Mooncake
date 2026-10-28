@@ -2,6 +2,7 @@
 
 import ctypes
 import hashlib
+import mmap
 import os
 import random
 import time
@@ -26,6 +27,7 @@ class StoreConfig:
     local_buffer_size: int = 128 * 1024 * 1024
     io_api: str = "buffer"
     verify: bool = False
+    batch_size: int = 8
 
 
 class MooncakeStoreStorage(Storage):
@@ -40,8 +42,10 @@ class MooncakeStoreStorage(Storage):
     def __init__(self, page_size, namespace, config, client_factory=None):
         if page_size <= 0 or not namespace:
             raise ValueError("positive page_size and nonempty namespace required")
-        if config.io_api not in ("plain", "buffer"):
-            raise ValueError("io_api must be plain or buffer")
+        if config.io_api not in ("plain", "buffer", "batch"):
+            raise ValueError("io_api must be plain, buffer or batch")
+        if type(config.batch_size) is not int or config.batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
         if config.global_segment_size < 0 or config.local_buffer_size <= 0:
             raise ValueError("invalid Store memory sizes")
         if config.protocol != "tcp" and "MC_FORCE_TCP" in os.environ:
@@ -56,6 +60,9 @@ class MooncakeStoreStorage(Storage):
         self._registered = []
         self._closed = False
         self.client = None
+        self._maps = []
+        self._send_slots = []
+        self._recv_slots = []
         self.reset_stats()
         if client_factory is None:
             try:
@@ -81,16 +88,26 @@ class MooncakeStoreStorage(Storage):
             if code != 0:
                 raise StorageOperationError(f"setup failed: {code}")
             self._payload = random.Random(0).randbytes(page_size)
-            if config.io_api == "buffer":
-                self._send = ctypes.create_string_buffer(page_size)
-                self._recv = ctypes.create_string_buffer(page_size)
-                ctypes.memmove(ctypes.addressof(self._send), self._payload, page_size)
-                for buf in (self._send, self._recv):
-                    ptr = ctypes.addressof(buf)
-                    code = self.client.register_buffer(ptr, page_size)
+            if config.io_api in ("buffer", "batch"):
+                total = page_size * self.batch_window
+                aligned = ((total + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE
+                for slots in (self._send_slots, self._recv_slots):
+                    # An unregistered guard page prevents adjacent registered
+                    # regions even if the OS places these mappings together.
+                    region = mmap.mmap(-1, aligned + mmap.PAGESIZE)
+                    self._maps.append(region)
+                    slots.extend(
+                        (ctypes.c_char * page_size).from_buffer(region, i * page_size)
+                        for i in range(self.batch_window)
+                    )
+                    ptr = ctypes.addressof(slots[0])
+                    code = self.client.register_buffer(ptr, aligned)
                     if code != 0:
                         raise StorageOperationError(f"register_buffer failed: {code}")
                     self._registered.append(ptr)
+                self._send, self._recv = self._send_slots[0], self._recv_slots[0]
+                for slot in self._send_slots:
+                    ctypes.memmove(ctypes.addressof(slot), self._payload, page_size)
         except BaseException:
             self.close(suppress_errors=True)
             raise
@@ -113,7 +130,84 @@ class MooncakeStoreStorage(Storage):
             "errors": {op: 0 for op in ("exists", "read", "write", "delete")},
             "verification_failures": 0,
             "sync_count": 0,
+            "batch_latencies_ms": {op: [] for op in ("exists", "read", "write")},
         }
+
+    @property
+    def batch_window(self):
+        return self.config.batch_size if self.config.io_api == "batch" else 1
+
+    def _batch_call(self, op, page_ids, fn):
+        if not page_ids or len(page_ids) > self.batch_window:
+            raise ValueError("batch must contain 1..batch_window pages")
+        values, latency = self._call(op, fn)
+        self.stats["batch_latencies_ms"][op].append(latency)
+        if not isinstance(values, (list, tuple)) or len(values) != len(page_ids):
+            self._fail(op, f"batch {op}: invalid result vector {values!r}")
+        return values, latency
+
+    def batch_exists(self, page_ids):
+        values, latency = self._batch_call(
+            "exists",
+            page_ids,
+            lambda: self.client.batch_is_exist([self.key(p) for p in page_ids]),
+        )
+        hits = []
+        invalid = []
+        for page, code in zip(page_ids, values):
+            if code not in (0, 1):
+                invalid.append(f"{page}: {code}")
+                continue
+            hits.append(code == 1)
+            self.stats["exists_count"] += 1
+            self.stats["exists_hits" if code == 1 else "exists_misses"] += 1
+            self.stats["exists_latencies_ms"].append(latency / len(page_ids))
+        if invalid:
+            self._fail("exists", "batch_is_exist failed: " + ", ".join(invalid))
+        return hits
+
+    def batch_write(self, page_ids):
+        return self._batch_io("write", page_ids)
+
+    def batch_read(self, page_ids):
+        return self._batch_io("read", page_ids)
+
+    def _batch_io(self, op, page_ids):
+        if self.config.io_api != "batch" or not 0 < len(page_ids) <= self.batch_window:
+            raise ValueError("batch I/O requires batch mode and 1..batch_size pages")
+        slots = self._send_slots if op == "write" else self._recv_slots
+        ptrs = [ctypes.addressof(slot) for slot in slots[: len(page_ids)]]
+        keys = [self.key(page) for page in page_ids]
+        if op == "write":
+            for page, ptr in zip(page_ids, ptrs):
+                marker = self._marker(page)
+                ctypes.memmove(ptr, marker, len(marker))
+            self._touched_pages.update(page_ids)
+        fn = self.client.batch_put_from if op == "write" else self.client.batch_get_into
+        values, latency = self._batch_call(
+            op, page_ids, lambda: fn(keys, ptrs, [self.page_size] * len(keys))
+        )
+        failures = []
+        for page, ptr, value in zip(page_ids, ptrs, values):
+            expected = 0 if op == "write" else self.page_size
+            if value != expected:
+                failures.append(f"{page}: expected {expected}, got {value}")
+                continue
+            if op == "read" and self.config.verify:
+                marker = self._marker(page)
+                if (
+                    ctypes.string_at(ptr, self.page_size)
+                    != marker + self._payload[len(marker) :]
+                ):
+                    self.stats["verification_failures"] += 1
+                    failures.append(f"{page}: data verification failed")
+                    continue
+            if op == "write":
+                self._written_pages.add(page)
+            self._record(op, latency / len(page_ids))
+        if failures:
+            self._fail(op, f"batch {op} failed: " + ", ".join(failures))
+        return latency
 
     def key(self, page_id):
         return f"{self.namespace}:{page_id}"
@@ -161,7 +255,7 @@ class MooncakeStoreStorage(Storage):
     def write(self, page_id, offset_in_page=0, length=None):
         self._full_page(offset_in_page, length)
         marker = self._marker(page_id)
-        if self.config.io_api == "buffer":
+        if self.config.io_api in ("buffer", "batch"):
             ptr = ctypes.addressof(self._send)
             ctypes.memmove(ptr, marker, len(marker))
 
@@ -183,7 +277,7 @@ class MooncakeStoreStorage(Storage):
 
     def read(self, page_id, offset_in_page=0, length=None):
         self._full_page(offset_in_page, length)
-        if self.config.io_api == "buffer":
+        if self.config.io_api in ("buffer", "batch"):
             ptr = ctypes.addressof(self._recv)
             size, latency = self._call(
                 "read",
@@ -232,6 +326,13 @@ class MooncakeStoreStorage(Storage):
             for op in ("read", "write")
         }
         result.update(
+            latency_semantics="amortized_batch_time_per_page"
+            if self.config.io_api == "batch"
+            else "single_page_api_time",
+            batch_calls={
+                op: {"count": len(values), **calc_percentiles(values)}
+                for op, values in self.stats["batch_latencies_ms"].items()
+            },
             sync_count=0,
             written_pages=len(self._written_pages),
             exists={
@@ -268,3 +369,10 @@ class MooncakeStoreStorage(Storage):
                 errors.append(str(exc))
         if errors and not suppress_errors:
             raise StorageOperationError("; ".join(errors))
+        if not errors:
+            self._send = self._recv = None
+            self._send_slots.clear()
+            self._recv_slots.clear()
+            for region in self._maps:
+                region.close()
+            self._maps.clear()

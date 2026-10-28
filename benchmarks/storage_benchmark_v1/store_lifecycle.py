@@ -20,6 +20,7 @@ def store_config(args):
         global_segment_size=args.global_segment_size,
         local_buffer_size=args.local_buffer_size,
         io_api=args.io_api,
+        batch_size=getattr(args, "batch_size", 8),
         verify=args.verify,
     )
 

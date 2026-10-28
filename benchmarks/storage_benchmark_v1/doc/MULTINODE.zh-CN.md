@@ -1,5 +1,7 @@
 # 跨节点测试：A 预热、C 读取、统一清理
 
+批量测试可将下面命令中的 `--io-api buffer` 替换为 `--io-api batch --batch-size 8`；内存需求、统计口径和可选 UB 退出规避见 [批量与 UB 回迁说明](BATCH_UB.zh-CN.md)。
+
 本流程验证 A 写入的对象能由 C 直接读取。B 提供实际存储容量；A、C 使用同一 Master、同一 Metadata 配置和兼容的 SDK。默认单客户端命令不变：不传 `--namespace` 时仍使用随机命名空间，并自动清理本轮对象。
 
 ## 代码和部署

@@ -23,6 +23,8 @@ SOURCE_BASE = {
 }
 # Only benchmark-relevant variables: do not export the process environment.
 ENV_FIELDS = (
+    "MC_EXIT_FAST",
+    "MC_BATCH_DEBUG",
     "MC_FORCE_TCP",
     "MC_UB_NUMA_AFFINITY_ENABLE",
     "MC_URMA_TRANS_MODE",
@@ -94,7 +96,15 @@ def add_store_arguments(parser):
         default=128 * 1024**2,
         help="SDK local buffer pool per client, bytes",
     )
-    parser.add_argument("--io-api", choices=("plain", "buffer"), default="buffer")
+    parser.add_argument(
+        "--io-api", choices=("plain", "buffer", "batch"), default="buffer"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Pages per batch call with --io-api batch",
+    )
     parser.add_argument(
         "--key-scope", choices=("independent", "shared"), default="independent"
     )
@@ -141,6 +151,8 @@ def validate_store_arguments(parser, args):
         parser.error("fsync options apply only to the disk backend")
     if args.global_segment_size < 0 or args.local_buffer_size <= 0:
         parser.error("Store memory sizes must be nonnegative/positive respectively")
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
     if args.max_requests is not None and args.max_requests <= 0:
         parser.error("--max-requests must be positive")
     protected_paths = ([args.key_manifest] if args.key_manifest else []) + (
@@ -390,7 +402,7 @@ def run_store_benchmark(
                     bench.process_request(req)
                 else:
                     io_latency = 0.0
-                    op = store.read if args.access_mode == "read" else store.write
+                    ids = []
                     for page_id in req.hash_ids:
                         # Client::Put returns success without transfer for an
                         # existing key. Fresh worker/sequence keys prevent an
@@ -400,7 +412,19 @@ def run_store_benchmark(
                             page_id = write_page_id(
                                 worker["id"], worker["write_sequence"], page_id
                             )
-                        io_latency += op(page_id)
+                        ids.append(page_id)
+                    if store.config.io_api == "batch":
+                        op = (
+                            store.batch_read
+                            if args.access_mode == "read"
+                            else store.batch_write
+                        )
+                        for i in range(0, len(ids), store.batch_window):
+                            io_latency += op(ids[i : i + store.batch_window])
+                    else:
+                        op = store.read if args.access_mode == "read" else store.write
+                        for page_id in ids:
+                            io_latency += op(page_id)
                     bench.stats["request_io_latencies_ms"].append(io_latency)
                     bench.stats["request_wall_latencies_ms"].append(
                         (time.perf_counter() - request_start) * 1000
@@ -457,10 +481,17 @@ def run_store_benchmark(
             for worker in workers:
                 if args.key_scope == "shared" and worker["id"] != 0:
                     continue
-                for page_id in unique_ids:
-                    worker["benchmark"].storage.write(page_id)
-                    if action == "prefill" and args.verify:
-                        worker["benchmark"].storage.read(page_id)
+                store = worker["benchmark"].storage
+                for i in range(0, len(unique_ids), store.batch_window):
+                    ids = unique_ids[i : i + store.batch_window]
+                    if store.config.io_api == "batch":
+                        store.batch_write(ids)
+                        if action == "prefill" and args.verify:
+                            store.batch_read(ids)
+                    else:
+                        store.write(ids[0])
+                        if action == "prefill" and args.verify:
+                            store.read(ids[0])
         preparation_stats = [w["benchmark"].storage.get_stats() for w in workers]
         for worker in workers:
             worker["benchmark"].storage.reset_stats()
@@ -521,6 +552,16 @@ def run_store_benchmark(
     exists_hits = sum(s["exists_hits"] for s in raw)
     exists_misses = sum(s["exists_misses"] for s in raw)
     storage_result.update(
+        batch_calls={
+            op: {
+                "count": sum(len(s["batch_latencies_ms"][op]) for s in raw),
+                **latency_stats([v for s in raw for v in s["batch_latencies_ms"][op]]),
+            }
+            for op in ("exists", "read", "write")
+        },
+        latency_semantics="amortized_batch_time_per_page"
+        if args.io_api == "batch"
+        else "single_page_api_time",
         sync_count=0,
         written_pages=len(
             {

@@ -5,6 +5,8 @@ See [Mooncake Store testing guide](MOONCAKE_STORE.zh-CN.md) for TCP/UB setup,
 the test matrix, metrics, and verified source baseline. Disk remains the default.
 For shared namespaces across processes, separate prefill/read stages and centralized
 cleanup, see the [multi-node operation guide](MULTINODE.zh-CN.md).
+For `--io-api batch --batch-size 8`, aligned buffers and the optional UB exit
+workaround, see [batch and UB migration notes](BATCH_UB.zh-CN.md).
 
 ## Overview
 
